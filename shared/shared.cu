@@ -16,6 +16,7 @@ using namespace std;
 
 // Default numeric type.
 typedef float real;
+#define TILE 32
 
 bool debugMode = false;
 
@@ -179,96 +180,97 @@ namespace host {
 
 // Kernels &c.
 namespace device {
-    template<size_t Nearest>
-    __device__ void warpReduce(volatile real *aux, size_t tid) {
-        if (Nearest >= 64) aux[tid] += aux[tid + 32];
-        if (Nearest >= 32) aux[tid] += aux[tid + 16];
-        if (Nearest >= 16) aux[tid] += aux[tid + 8];
-        if (Nearest >=  8) aux[tid] += aux[tid + 4];
-        if (Nearest >=  4) aux[tid] += aux[tid + 2];
-        if (Nearest >=  2) aux[tid] += aux[tid + 1];
-    }
+    __global__ void scalar_noshared(real *mat, int dim, int nvec, real *res) {
+        // Skip lower echelon blocks (now in the standard fashion.)
+        if (blockIdx.x * blockDim.x > (blockIdx.y + 1) * blockDim.y)
+            return;
 
-    __device__ void deriveId(int m, int x, int y, volatile int *realx, volatile int *realy) {
-        int ceil = (m - 1) / 2 + 1;
+        int xidx = blockIdx.x * blockDim.x + threadIdx.x;
+        if (xidx >= nvec) return;
 
-        if (m & 1) {
-            if (x > y) {
-                *realx = ceil + y;
-                *realy = ceil + x;
-            }
-            else {
-                *realx = x;
-                *realy = y + 1;
-            }
-        }
-        else {
-            if (x >= y) {
-                *realx = ceil + y;
-                *realy = ceil + x + 1;
-            }
-            else {
-                *realx = x;
-                *realy = y;
-            }
-        }
-    }
+        int yidx = blockIdx.y * blockDim.y + threadIdx.y;
+        if (yidx >= nvec) return;
 
-    // Compute <x, y> for x, y: R^dim and output into *res
-    template<size_t Nearest>
-    __global__ void scalar(real *mat, int dim, int nvec, real *res) {
-        size_t tid = threadIdx.x;
-
-        int realx, realy;
-        deriveId(nvec - 1, blockIdx.x, blockIdx.y, &realx, &realy);
-        real *x = &mat[dim * realx], *y = &mat[dim * realy];
-
-        size_t lo = (tid * dim) / blockDim.x,
-            hi = ((tid + 1) * dim) / blockDim.x;
+        real *x = &mat[dim * xidx], *y = &mat[dim * yidx];
         real total = 0;
-        for (size_t i = lo; i < hi; ++i) {
+        for (int i = 0; i < dim; ++i) {
             total += x[i] * y[i];
         }
 
-        __shared__ real aux[Nearest];
-        aux[tid] = total;
-        if (tid + blockDim.x < Nearest) aux[tid + blockDim.x] = 0;
-        __syncthreads();
-
-        for (unsigned int s = Nearest / 2; s > 1024; s >>= 1) {
-            if (tid < s) aux[tid] += aux[tid + s];
-            __syncthreads();
-        }
-
-        if (Nearest >= 1024) {
-            if (tid < 512) aux[tid] += aux[tid + 512];
-            __syncthreads();
-        }
-        if (Nearest >= 512) {
-            if (tid < 256) aux[tid] += aux[tid + 256];
-            __syncthreads();
-        }
-        if (Nearest >= 256) {
-            if (tid < 128) aux[tid] += aux[tid + 128];
-            __syncthreads();
-        }
-        if (Nearest >= 128) {
-            if (tid < 64) aux[tid] += aux[tid + 64];
-            __syncthreads();
-        }
-
-        if (tid < 32) warpReduce<Nearest>(aux, tid);
-        if (tid == 0) res[nvec * realx + realy] = aux[0];
+        res[xidx * nvec + yidx] = total;
     }
 
-    // Compute similarity matrix for given CNV into sim,
-    // using stream pool given with iterator.
-    template<size_t Block, size_t Nearest>
-    void similarity(real *cnv, real *sim, int dim, int nvec) {
-        dim3 grid(nvec / 2, 2 * ((nvec - 1) / 2) + 1);
-        device::scalar<Nearest>
-            <<<grid, Block>>>
-            (cnv, dim, nvec, sim);
+    void similarity_noshared(real *cnv, real *sim, dim3 block, int dim, int nvec) {
+        dim3 grid(nvec / block.x + 1, nvec / block.y + 1);
+        device::scalar_noshared<<<grid, block>>>(cnv, dim, nvec, sim);
+    }
+
+    __global__ void scalar_conflicts(real *mat, int dim, int nvec, real *res) {
+        if (blockIdx.x * blockDim.x > (blockIdx.y + 1) * blockDim.y)
+            return;
+        
+        int xidx = blockIdx.x * blockDim.x + threadIdx.x;
+        real *x = xidx < nvec ? &mat[xidx * dim] : NULL;
+
+        int yidx = blockIdx.y * blockDim.y + threadIdx.y;
+        real *y = yidx < nvec ? &mat[yidx * dim] : NULL;
+        
+        __shared__ real left[TILE][TILE], right[TILE][TILE];
+        real sum = 0.0f;
+        for (int i = 0; i < dim; i += blockDim.x) {
+            if (x && i + threadIdx.y < dim)
+                left[threadIdx.x][threadIdx.y] = x[i + threadIdx.y];
+            if (y && i + threadIdx.x < dim)
+                right[threadIdx.x][threadIdx.y] = y[i + threadIdx.x];
+            __syncthreads();
+            
+            for (int j = 0; j < blockDim.x && i + j < dim; ++j) {
+                sum += left[threadIdx.x][j] * right[j][threadIdx.y];
+            }
+            __syncthreads();
+        }
+
+        if (x && y) 
+            res[xidx * nvec + yidx] = sum;
+    }
+
+    void similarity_conflicts(real *cnv, real *sim, dim3 block, int dim, int nvec) {
+        dim3 grid(nvec / block.x + 1, nvec / block.y + 1);
+        device::scalar_conflicts<<<grid, block>>>(cnv, dim, nvec, sim);
+    }
+
+    __global__ void scalar_noconflicts(real *mat, int dim, int nvec, real *res) {
+        if (blockIdx.x * blockDim.x > (blockIdx.y + 1) * blockDim.y)
+            return;
+        
+        int xidx = blockIdx.x * blockDim.x + threadIdx.x;
+        real *x = xidx < nvec ? &mat[xidx * dim] : NULL;
+
+        int yidx = blockIdx.y * blockDim.y + threadIdx.y;
+        real *y = yidx < nvec ? &mat[yidx * dim] : NULL;
+        
+        __shared__ real left[TILE][TILE+1], right[TILE][TILE+1];
+        real sum = 0.0f;
+        for (int i = 0; i < dim; i += blockDim.x) {
+            if (x && i + threadIdx.y < dim)
+                left[threadIdx.x][threadIdx.y] = x[i + threadIdx.y];
+            if (y && i + threadIdx.x < dim)
+                right[threadIdx.x][threadIdx.y] = y[i + threadIdx.x];
+            __syncthreads();
+            
+            for (int j = 0; j < blockDim.x && i + j < dim; ++j) {
+                sum += left[threadIdx.x][j] * right[j][threadIdx.y];
+            }
+            __syncthreads();
+        }
+
+        if (x && y) 
+            res[xidx * nvec + yidx] = sum;
+    }
+
+    void similarity_noconflicts(real *cnv, real *sim, dim3 block, int dim, int nvec) {
+        dim3 grid(nvec / block.x + 1, nvec / block.y + 1);
+        device::scalar_noconflicts<<<grid, block>>>(cnv, dim, nvec, sim);
     }
 }
 
@@ -347,39 +349,6 @@ real correlation(real *x, real *y, int nvec) {
     return covxy / sqrt(varx * vary);
 }
 
-template<size_t Block, size_t Nearest>
-void computeFor(real *cnv, real *sim, real *simLocal, real *ref,
-                int dim, int nvec,
-                Timer& t) {
-    stringstream ss;
-    ss << "Similarity (Device -"
-       << " BlockSize = " << Block
-       << ")";
-
-    vector<real> times;
-
-    Timer::Frame fr = t.measure(ss.str(), false);
-    for (size_t i = 0; i < 10; ++i) {
-        fr.enter();
-        device::similarity<Block, Nearest>(cnv, sim, dim, nvec);
-        cuda::check(cudaMemcpy(simLocal, sim,
-                               nvec * nvec * sizeof(real),
-                               cudaMemcpyDeviceToHost));
-        fr.leave();
-    }
-    real total, mean, std;
-    fr.resolve(total, mean, std);
-
-    cout << "BLOCKSIZE " << Block
-         << " TIME " << mean << '\n';
-
-    if (debugMode) {
-        reportStats(simLocal, nvec);
-        real corr = correlation(simLocal, ref, nvec);
-        cerr << "Correlation: " << corr << '\n';
-    }
-}
-
 int main(int argc, char **argv) {
     char *filename = NULL;
     for (int i = 1; i < argc; ++i) {
@@ -426,23 +395,58 @@ int main(int argc, char **argv) {
         fr = t.measure("Similarity (Host)");
         host::similarity(cnv.data(), simHost, dim, nvec);
         reportStats(simHost, nvec);
-        fr.resolve();
+        fr.leave();
     }
 
-    computeFor<  32,  32>(cnvDev, simDev, simDevLocal, simHost, dim, nvec, t);
-    computeFor<  64,  64>(cnvDev, simDev, simDevLocal, simHost, dim, nvec, t);
-    computeFor<  96, 128>(cnvDev, simDev, simDevLocal, simHost, dim, nvec, t);
-    computeFor< 128, 128>(cnvDev, simDev, simDevLocal, simHost, dim, nvec, t);
-    computeFor< 192, 256>(cnvDev, simDev, simDevLocal, simHost, dim, nvec, t);
-    computeFor< 256, 256>(cnvDev, simDev, simDevLocal, simHost, dim, nvec, t);
-    computeFor< 320, 512>(cnvDev, simDev, simDevLocal, simHost, dim, nvec, t);
-    computeFor< 384, 512>(cnvDev, simDev, simDevLocal, simHost, dim, nvec, t);
-    computeFor< 448, 512>(cnvDev, simDev, simDevLocal, simHost, dim, nvec, t);
-    computeFor< 512, 512>(cnvDev, simDev, simDevLocal, simHost, dim, nvec, t);
-    computeFor< 640,1024>(cnvDev, simDev, simDevLocal, simHost, dim, nvec, t);
-    computeFor< 768,1024>(cnvDev, simDev, simDevLocal, simHost, dim, nvec, t);
-    computeFor< 896,1024>(cnvDev, simDev, simDevLocal, simHost, dim, nvec, t);
-    computeFor<1024,1024>(cnvDev, simDev, simDevLocal, simHost, dim, nvec, t);
+    int sides[] = { 4, 8, 12, 16, 20, 24, 28, 32 };
+    typedef void (*method_t)(real*, real*, dim3, int, int);
+
+    method_t methods[] = { &device::similarity_noshared, &device::similarity_conflicts, 
+        &device::similarity_noconflicts };
+    string labels[] = { "NO_SHARED", "CONFLICTS", "NOCONFLICTS" };
+    int nmethods = 3;
+
+    size_t nsides = sizeof(sides) / sizeof(int);
+    for (int i = 0; i < nsides; ++i) {
+        int x = sides[i];
+        for (int j = 0; j < nsides; ++j) {
+            int y = sides[j];
+            if ((x != 4 || y != 4) && (x == y)) {
+                for (int m = 0; m < nmethods; ++m) {
+                    stringstream ss;
+                    ss << "Similarity (" << labels[m] << " - "
+                       << " X = " << x
+                       << "; Y = " << y
+                       << ")";
+
+                    dim3 block(x, y);
+
+                    fr = t.measure(ss.str(), false);
+                    for (size_t i = 0; i < 50; ++i) {
+                        fr.enter();
+                        methods[m](cnvDev, simDev, block, dim, nvec);
+                        if (debugMode)
+                            cuda::check();
+                        cuda::check(cudaMemcpy(simDevLocal, simDev,
+                                            nvec * nvec * sizeof(real),
+                                            cudaMemcpyDeviceToHost));
+                        fr.leave();
+                    }
+                    real total, mean, std;
+                    fr.resolve(total, mean, std);
+
+                    cout << "X " << x << " Y " << y << " " << labels[m]
+                        << " TIME " << mean << '\n';
+
+                    if (debugMode) {
+                        reportStats(simDevLocal, nvec);
+                        real corr = correlation(simDevLocal, simHost, nvec);
+                        cerr << "Correlation: " << corr << '\n';
+                    }
+                }
+            }
+        }
+    }
 
     return EXIT_SUCCESS;
 }

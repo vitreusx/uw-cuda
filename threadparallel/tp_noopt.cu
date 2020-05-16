@@ -148,7 +148,7 @@ namespace host {
     void similarity(real *cnv, real *sim, int dim, int nvec) {
         for (int i = 0; i < nvec; ++i) {
             real *x = cnv + dim * i;
-            for (int j = i + 1; j < nvec; ++j) {
+            for (int j = 0; j < nvec; ++j) {
                 real *y = cnv + dim * j;
                 sim[i*nvec+j] = host::scalar(x, y, dim);
             }
@@ -179,95 +179,29 @@ namespace host {
 
 // Kernels &c.
 namespace device {
-    template<size_t Nearest>
-    __device__ void warpReduce(volatile real *aux, size_t tid) {
-        if (Nearest >= 64) aux[tid] += aux[tid + 32];
-        if (Nearest >= 32) aux[tid] += aux[tid + 16];
-        if (Nearest >= 16) aux[tid] += aux[tid + 8];
-        if (Nearest >=  8) aux[tid] += aux[tid + 4];
-        if (Nearest >=  4) aux[tid] += aux[tid + 2];
-        if (Nearest >=  2) aux[tid] += aux[tid + 1];
-    }
-
-    __device__ void deriveId(int m, int x, int y, volatile int *realx, volatile int *realy) {
-        int ceil = (m - 1) / 2 + 1;
-
-        if (m & 1) {
-            if (x > y) {
-                *realx = ceil + y;
-                *realy = ceil + x;
-            }
-            else {
-                *realx = x;
-                *realy = y + 1;
-            }
-        }
-        else {
-            if (x >= y) {
-                *realx = ceil + y;
-                *realy = ceil + x + 1;
-            }
-            else {
-                *realx = x;
-                *realy = y;
-            }
-        }
-    }
-
     // Compute <x, y> for x, y: R^dim and output into *res
-    template<size_t Nearest>
     __global__ void scalar(real *mat, int dim, int nvec, real *res) {
-        size_t tid = threadIdx.x;
+        size_t xidx = blockIdx.x * blockDim.x + threadIdx.x;
+        if (xidx >= nvec) return;
 
-        int realx, realy;
-        deriveId(nvec - 1, blockIdx.x, blockIdx.y, &realx, &realy);
-        real *x = &mat[dim * realx], *y = &mat[dim * realy];
+        size_t yidx = blockIdx.y * blockDim.y + threadIdx.y;
+        if (yidx >= nvec) return;
 
-        size_t lo = (tid * dim) / blockDim.x,
-            hi = ((tid + 1) * dim) / blockDim.x;
+        real *x = &mat[dim * xidx], *y = &mat[dim * yidx];
         real total = 0;
-        for (size_t i = lo; i < hi; ++i) {
+        for (int i = 0; i < dim; ++i) {
             total += x[i] * y[i];
         }
 
-        __shared__ real aux[Nearest];
-        aux[tid] = total;
-        if (tid + blockDim.x < Nearest) aux[tid + blockDim.x] = 0;
-        __syncthreads();
-
-        for (unsigned int s = Nearest / 2; s > 1024; s >>= 1) {
-            if (tid < s) aux[tid] += aux[tid + s];
-            __syncthreads();
-        }
-
-        if (Nearest >= 1024) {
-            if (tid < 512) aux[tid] += aux[tid + 512];
-            __syncthreads();
-        }
-        if (Nearest >= 512) {
-            if (tid < 256) aux[tid] += aux[tid + 256];
-            __syncthreads();
-        }
-        if (Nearest >= 256) {
-            if (tid < 128) aux[tid] += aux[tid + 128];
-            __syncthreads();
-        }
-        if (Nearest >= 128) {
-            if (tid < 64) aux[tid] += aux[tid + 64];
-            __syncthreads();
-        }
-
-        if (tid < 32) warpReduce<Nearest>(aux, tid);
-        if (tid == 0) res[nvec * realx + realy] = aux[0];
+        res[xidx * nvec + yidx] = total;
     }
 
     // Compute similarity matrix for given CNV into sim,
     // using stream pool given with iterator.
-    template<size_t Block, size_t Nearest>
-    void similarity(real *cnv, real *sim, int dim, int nvec) {
-        dim3 grid(nvec / 2, 2 * ((nvec - 1) / 2) + 1);
-        device::scalar<Nearest>
-            <<<grid, Block>>>
+    void similarity(real *cnv, real *sim, dim3 block, int dim, int nvec) {
+        dim3 grid(nvec / block.x + 1, nvec / block.y + 1);
+        device::scalar
+            <<<grid, block>>>
             (cnv, dim, nvec, sim);
     }
 }
@@ -328,7 +262,7 @@ real correlation(real *x, real *y, int nvec) {
     xsum = ysum = xysum = xxsum = yysum = 0;
 
     for (int i = 0; i < nvec; ++i) {
-        for (int j = i + 1; j < nvec; ++j) {
+        for (int j = 0; j < nvec; ++j) {
             int id = i * nvec + j;
             real xi = x[id], yi = y[id];
             xsum += xi;
@@ -339,45 +273,12 @@ real correlation(real *x, real *y, int nvec) {
         }
     }
 
-    int dim = (nvec * (nvec - 1)) / 2;
+    int dim = nvec * nvec;
     real xmean = xsum / dim, ymean = ysum / dim;
     real covxy = xysum - dim * xmean * ymean;
     real varx = xxsum - dim * xmean * xmean;
     real vary = yysum - dim * ymean * ymean;
     return covxy / sqrt(varx * vary);
-}
-
-template<size_t Block, size_t Nearest>
-void computeFor(real *cnv, real *sim, real *simLocal, real *ref,
-                int dim, int nvec,
-                Timer& t) {
-    stringstream ss;
-    ss << "Similarity (Device -"
-       << " BlockSize = " << Block
-       << ")";
-
-    vector<real> times;
-
-    Timer::Frame fr = t.measure(ss.str(), false);
-    for (size_t i = 0; i < 10; ++i) {
-        fr.enter();
-        device::similarity<Block, Nearest>(cnv, sim, dim, nvec);
-        cuda::check(cudaMemcpy(simLocal, sim,
-                               nvec * nvec * sizeof(real),
-                               cudaMemcpyDeviceToHost));
-        fr.leave();
-    }
-    real total, mean, std;
-    fr.resolve(total, mean, std);
-
-    cout << "BLOCKSIZE " << Block
-         << " TIME " << mean << '\n';
-
-    if (debugMode) {
-        reportStats(simLocal, nvec);
-        real corr = correlation(simLocal, ref, nvec);
-        cerr << "Correlation: " << corr << '\n';
-    }
 }
 
 int main(int argc, char **argv) {
@@ -426,23 +327,47 @@ int main(int argc, char **argv) {
         fr = t.measure("Similarity (Host)");
         host::similarity(cnv.data(), simHost, dim, nvec);
         reportStats(simHost, nvec);
-        fr.resolve();
+        fr.leave();
     }
 
-    computeFor<  32,  32>(cnvDev, simDev, simDevLocal, simHost, dim, nvec, t);
-    computeFor<  64,  64>(cnvDev, simDev, simDevLocal, simHost, dim, nvec, t);
-    computeFor<  96, 128>(cnvDev, simDev, simDevLocal, simHost, dim, nvec, t);
-    computeFor< 128, 128>(cnvDev, simDev, simDevLocal, simHost, dim, nvec, t);
-    computeFor< 192, 256>(cnvDev, simDev, simDevLocal, simHost, dim, nvec, t);
-    computeFor< 256, 256>(cnvDev, simDev, simDevLocal, simHost, dim, nvec, t);
-    computeFor< 320, 512>(cnvDev, simDev, simDevLocal, simHost, dim, nvec, t);
-    computeFor< 384, 512>(cnvDev, simDev, simDevLocal, simHost, dim, nvec, t);
-    computeFor< 448, 512>(cnvDev, simDev, simDevLocal, simHost, dim, nvec, t);
-    computeFor< 512, 512>(cnvDev, simDev, simDevLocal, simHost, dim, nvec, t);
-    computeFor< 640,1024>(cnvDev, simDev, simDevLocal, simHost, dim, nvec, t);
-    computeFor< 768,1024>(cnvDev, simDev, simDevLocal, simHost, dim, nvec, t);
-    computeFor< 896,1024>(cnvDev, simDev, simDevLocal, simHost, dim, nvec, t);
-    computeFor<1024,1024>(cnvDev, simDev, simDevLocal, simHost, dim, nvec, t);
+    int sides[] = { 4, 8, 12, 16, 20, 24, 28, 32 };
+    size_t nsides = sizeof(sides) / sizeof(int);
+    for (int i = 0; i < nsides; ++i) {
+        int x = sides[i];
+        for (int j = 0; j < nsides; ++j) {
+            int y = sides[j];
+            if (x != 4 || y != 4) {
+                stringstream ss;
+                ss << "Similarity (Device -"
+                   << " X = " << x
+                   << "; Y = " << y
+                   << ")";
+
+                dim3 block(x, y);
+
+                fr = t.measure(ss.str(), false);
+                for (size_t i = 0; i < 10; ++i) {
+                    fr.enter();
+                    device::similarity(cnvDev, simDev, block, dim, nvec);
+                    cuda::check(cudaMemcpy(simDevLocal, simDev,
+                                           nvec * nvec * sizeof(real),
+                                           cudaMemcpyDeviceToHost));
+                    fr.leave();
+                }
+                real total, mean, std;
+                fr.resolve(total, mean, std);
+
+                cout << "X " << x << " Y " << y
+                     << " TIME " << mean << '\n';
+
+                if (debugMode) {
+                    reportStats(simDevLocal, nvec);
+                    real corr = correlation(simDevLocal, simHost, nvec);
+                    cerr << "Correlation: " << corr << '\n';
+                }
+            }
+        }
+    }
 
     return EXIT_SUCCESS;
 }

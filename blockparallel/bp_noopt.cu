@@ -148,7 +148,7 @@ namespace host {
     void similarity(real *cnv, real *sim, int dim, int nvec) {
         for (int i = 0; i < nvec; ++i) {
             real *x = cnv + dim * i;
-            for (int j = i + 1; j < nvec; ++j) {
+            for (int j = 0; j < nvec; ++j) {
                 real *y = cnv + dim * j;
                 sim[i*nvec+j] = host::scalar(x, y, dim);
             }
@@ -189,39 +189,11 @@ namespace device {
         if (Nearest >=  2) aux[tid] += aux[tid + 1];
     }
 
-    __device__ void deriveId(int m, int x, int y, volatile int *realx, volatile int *realy) {
-        int ceil = (m - 1) / 2 + 1;
-
-        if (m & 1) {
-            if (x > y) {
-                *realx = ceil + y;
-                *realy = ceil + x;
-            }
-            else {
-                *realx = x;
-                *realy = y + 1;
-            }
-        }
-        else {
-            if (x >= y) {
-                *realx = ceil + y;
-                *realy = ceil + x + 1;
-            }
-            else {
-                *realx = x;
-                *realy = y;
-            }
-        }
-    }
-
     // Compute <x, y> for x, y: R^dim and output into *res
     template<size_t Nearest>
     __global__ void scalar(real *mat, int dim, int nvec, real *res) {
         size_t tid = threadIdx.x;
-
-        int realx, realy;
-        deriveId(nvec - 1, blockIdx.x, blockIdx.y, &realx, &realy);
-        real *x = &mat[dim * realx], *y = &mat[dim * realy];
+        real *x = &mat[dim * blockIdx.x], *y = &mat[dim * blockIdx.y];
 
         size_t lo = (tid * dim) / blockDim.x,
             hi = ((tid + 1) * dim) / blockDim.x;
@@ -258,14 +230,14 @@ namespace device {
         }
 
         if (tid < 32) warpReduce<Nearest>(aux, tid);
-        if (tid == 0) res[nvec * realx + realy] = aux[0];
+        if (tid == 0) res[nvec * blockIdx.x + blockIdx.y] = aux[0];
     }
 
     // Compute similarity matrix for given CNV into sim,
     // using stream pool given with iterator.
     template<size_t Block, size_t Nearest>
     void similarity(real *cnv, real *sim, int dim, int nvec) {
-        dim3 grid(nvec / 2, 2 * ((nvec - 1) / 2) + 1);
+        dim3 grid(nvec, nvec);
         device::scalar<Nearest>
             <<<grid, Block>>>
             (cnv, dim, nvec, sim);
@@ -328,7 +300,7 @@ real correlation(real *x, real *y, int nvec) {
     xsum = ysum = xysum = xxsum = yysum = 0;
 
     for (int i = 0; i < nvec; ++i) {
-        for (int j = i + 1; j < nvec; ++j) {
+        for (int j = 0; j < nvec; ++j) {
             int id = i * nvec + j;
             real xi = x[id], yi = y[id];
             xsum += xi;
@@ -339,7 +311,7 @@ real correlation(real *x, real *y, int nvec) {
         }
     }
 
-    int dim = (nvec * (nvec - 1)) / 2;
+    int dim = nvec * nvec;
     real xmean = xsum / dim, ymean = ysum / dim;
     real covxy = xysum - dim * xmean * ymean;
     real varx = xxsum - dim * xmean * xmean;

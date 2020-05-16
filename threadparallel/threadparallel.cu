@@ -10,14 +10,13 @@
 #include <stdexcept>
 #include <cstring>
 #include <vector>
-#include <memory>
-#include <stack>
 #include <fstream>
 #include <sstream>
 using namespace std;
 
 // Default numeric type.
 typedef float real;
+#define TILE 32
 
 bool debugMode = false;
 
@@ -33,51 +32,95 @@ namespace cuda {
         check(cudaGetLastError());
     }
 
-    // More malloc-like cudaMalloc
     template<typename T>
-    T *malloc(size_t nelems) {
-        T *res;
-        cuda::check(cudaMalloc((void **)&res, sizeof(T) * nelems));
-        return res;
-    }
+    class Buffer {
+    private:
+        T *ptr;
 
-    // More free-like cudaFree
-    void free(void *ptr) {
-        cuda::check(cudaFree(ptr));
-    }
+    public:
+        Buffer(size_t nitems) {
+            cuda::check(cudaMalloc((void **)&ptr, sizeof(T) * nitems));
+        }
+
+        ~Buffer() {
+            cuda::check(cudaFree(ptr));
+        }
+
+        operator T*() {
+            return ptr;
+        }
+    };
 }
 
 // Time measurement facility.
 class Timer {
-private:
-    struct Entry {
+public:
+    class Frame {
+    private:
         time_t prior;
         string message;
+        vector<real> times;
+        bool single;
+
+    public:
+        Frame() {}
+
+        Frame(string msg, bool _single) {
+            message = msg;
+            single = _single;
+            if (single) enter();
+        }
+
+        void enter() {
+            prior = clock();
+        }
+
+        void leave() {
+            time_t after = clock();
+            real dur = (real)(after - prior) / CLOCKS_PER_SEC;
+            times.push_back(dur);
+        }
+
+        void resolve(real &total, real &mean, real &std) {
+            if (single) leave();
+
+            if (debugMode)
+                cerr << "[" << message << "] Measurement complete.\n";
+            total = 0;
+            for (size_t i = 0; i < times.size(); ++i) {
+                total += times[i];
+            }
+
+            mean = total / times.size();
+            std = 0;
+            for (size_t i = 0; i < times.size(); ++i) {
+                std += (times[i] - mean) * (times[i] - mean);
+            }
+            if (times.size() > 1) std /= times.size() - 1;
+            std = sqrt(std);
+
+            if (times.size() >= 1) {
+                if (debugMode)
+                    cerr << "\t    N: " << times.size() << "\n"
+                         << "\tTotal: " << total << "s\n";
+            }
+            if (times.size() > 1) {
+                if (debugMode)
+                    cerr << "\t Mean: " << mean << "s\n"
+                         << "\t  Std: " << std << "s\n";
+            }
+        }
+
+        void resolve() {
+            real total, mean, std;
+            resolve(total, mean, std);
+        }
     };
 
-    stack<Entry> entries;
-
-public:
-    void enter(string msg) {
-        Entry en;
-        en.message = msg;
-
-        entries.push(en);
+    Frame measure(string msg, bool single = true) {
         if (debugMode)
-            cerr << "[" << msg << "] Starting timer." << '\n';
-
-        entries.top().prior = clock();
-    }
-
-    real leave() {
-        int after = clock();
-        Entry en = entries.top();
-        entries.pop();
-
-        real dur = (real)(after - en.prior) / CLOCKS_PER_SEC;
-        if (debugMode)
-            cerr << "[" << en.message << "] Timing done: took " << dur << "s." << '\n';
-        return dur;
+            cerr << "[" << msg << "] Measuring.\n";
+        return Frame(msg, single);
     }
 };
 
@@ -106,49 +149,96 @@ namespace host {
     void similarity(real *cnv, real *sim, int dim, int nvec) {
         for (int i = 0; i < nvec; ++i) {
             real *x = cnv + dim * i;
-            for (int j = 0; j < nvec; ++j) {
+            for (int j = i + 1; j < nvec; ++j) {
                 real *y = cnv + dim * j;
                 sim[i*nvec+j] = host::scalar(x, y, dim);
             }
         }
     }
+
+    template<typename T>
+    class Buffer {
+    private:
+        T *ptr;
+
+    public:
+        Buffer(size_t nitems) {
+            if (!(ptr = (T *)malloc(sizeof(T) * nitems))) {
+                throw std::runtime_error("malloc");
+            }
+        }
+
+        ~Buffer() {
+            free(ptr);
+        }
+
+        operator T*() {
+            return ptr;
+        }
+    };
 }
 
 // Kernels &c.
 namespace device {
+    __device__ void deriveId(int m, int x, int y, volatile int *realx, volatile int *realy) {
+        int ceil = (m - 1) / 2 + 1;
+
+        if (m & 1) {
+            if (x > y) {
+                *realx = ceil + y;
+                *realy = ceil + x;
+            }
+            else {
+                *realx = x;
+                *realy = y + 1;
+            }
+        }
+        else {
+            if (x >= y) {
+                *realx = ceil + y;
+                *realy = ceil + x + 1;
+            }
+            else {
+                *realx = x;
+                *realy = y;
+            }
+        }
+    }
+
     // Compute <x, y> for x, y: R^dim and output into *res
-    __global__ void scalar(real *mat, int dim, int nvec, real *res) {
+    __global__ void scalar_noshared(real *mat, int dim, int nvec, int dimx, int dimy, real *res) {
         size_t xidx = blockIdx.x * blockDim.x + threadIdx.x;
-        if (xidx >= nvec) return;
+        if (xidx >= dimx) return;
 
         size_t yidx = blockIdx.y * blockDim.y + threadIdx.y;
-        if (yidx >= nvec) return;
+        if (yidx >= dimy) return;
 
-        real *x = &mat[dim * xidx], *y = &mat[dim * yidx];
+        int realx, realy;
+        deriveId(nvec - 1, xidx, yidx, &realx, &realy);
+
+        real *x = &mat[dim * realx], *y = &mat[dim * realy];
         real total = 0;
         for (int i = 0; i < dim; ++i) {
             total += x[i] * y[i];
         }
 
-        res[xidx * nvec + yidx] = total;
+        res[realx * nvec + realy] = total;
     }
 
     // Compute similarity matrix for given CNV into sim,
     // using stream pool given with iterator.
-    void similarity(real *cnv, real *sim, dim3 block, int dim, int nvec) {
-        dim3 grid(nvec / block.x + 1, nvec / block.y + 1);
+    void similarity_noshared(real *cnv, real *sim, dim3 block, int dim, int nvec) {
+        int dimx = nvec / 2, dimy = 2 * ((nvec - 1) / 2) + 1;
+        dim3 grid(dimx / block.x + 1, dimy / block.y + 1);
         device::scalar
             <<<grid, block>>>
-            (cnv, dim, nvec, sim);
+            (cnv, dim, nvec, dimx, dimy, sim);
     }
 }
 
 vector<real> readCSV(char *filename, int& dim, int& nvec) {
     size_t maxline = 2000000;
-    unique_ptr<char, void(*)(void *)> buf {
-        (char *)malloc(maxline),
-        free
-    };
+    host::Buffer<char> buf(maxline);
 
     // Reserve CNV.
     vector<real> cnv;
@@ -156,15 +246,15 @@ vector<real> readCSV(char *filename, int& dim, int& nvec) {
 
     ifstream file(filename);
     size_t linum = 0;
-    while (file.getline(buf.get(), maxline)) {
+    while (file.getline(buf, maxline)) {
         // Skip 1st line (i.e. the header)
         if (++linum > 1) {
             size_t colnum = 0;
-            char *cur = strtok(buf.get(), ",");
+            char *cur = strtok(buf, ",");
             while (cur) {
                 // Skip 1st column; push values in flat form.
                 if (++colnum > 1) cnv.push_back(atof(cur));
-                cur = strtok(nullptr, ",");
+                cur = strtok(NULL, ",");
             }
         }
     }
@@ -197,19 +287,23 @@ void reportStats(real *sim, int nvec) {
 
 // Compute Pearson correlation coefficient (i.e. cov(X, Y)/[std(X)std(Y])
 // for samples X, Y: R^dim
-real correlation(real *x, real *y, int dim) {
+real correlation(real *x, real *y, int nvec) {
     real xsum, ysum, xysum, xxsum, yysum;
     xsum = ysum = xysum = xxsum = yysum = 0;
 
-    for (int i = 0; i < dim; ++i) {
-        real xi = x[i], yi = y[i];
-        xsum += xi;
-        ysum += yi;
-        xysum += xi * yi;
-        xxsum += xi * xi;
-        yysum += yi * yi;
+    for (int i = 0; i < nvec; ++i) {
+        for (int j = i + 1; j < nvec; ++j) {
+            int id = i * nvec + j;
+            real xi = x[id], yi = y[id];
+            xsum += xi;
+            ysum += yi;
+            xysum += xi * yi;
+            xxsum += xi * xi;
+            yysum += yi * yi;
+        }
     }
 
+    int dim = (nvec * (nvec - 1)) / 2;
     real xmean = xsum / dim, ymean = ysum / dim;
     real covxy = xysum - dim * xmean * ymean;
     real varx = xxsum - dim * xmean * xmean;
@@ -218,7 +312,7 @@ real correlation(real *x, real *y, int dim) {
 }
 
 int main(int argc, char **argv) {
-    char *filename = nullptr;
+    char *filename = NULL;
     for (int i = 1; i < argc; ++i) {
         if (!debugMode && (!strcmp(argv[i], "-g") || !strcmp(argv[i], "--debug"))) {
             debugMode = true;
@@ -235,77 +329,78 @@ int main(int argc, char **argv) {
     }
 
     Timer t;
+    Timer::Frame fr;
 
-    t.enter("Reading & parsing CSV file");
+    fr = t.measure("Reading & parsing CSV file");
     int nvec = 150, dim = 50000;
     vector<real> cnv = readCSV(filename, dim, nvec);
-    t.leave();
+    fr.resolve();
 
-    t.enter("Normalizing CNV");
+    fr = t.measure("Normalizing CNV");
     host::normalize(cnv, dim, nvec);
-    t.leave();
+    fr.resolve();
 
-    t.enter("Allocating similarity matrices");
-    unique_ptr<real, void(*)(void *)> simHost {
-        (real *)malloc(nvec * nvec * sizeof(real)),
-        free
-    };
+    fr = t.measure("Allocating similarity matrices");
+    host::Buffer<real> simHost(nvec * nvec);
+    cuda::Buffer<real> simDev(nvec * nvec);
+    host::Buffer<real> simDevLocal(nvec * nvec);
+    fr.resolve();
 
-    unique_ptr<real, void(*)(void *)> simDev {
-        cuda::malloc<real>(nvec * nvec),
-        cuda::free
-    };
-
-    unique_ptr<real, void(*)(void *)> simDevLocal {
-        (real *)malloc(nvec * nvec * sizeof(real)),
-        free
-    };
-    t.leave();
-
-    t.enter("Allocating & copying CNV to the device");
-    unique_ptr<real, void(*)(void *)> cnvDev {
-        cuda::malloc<real>(nvec * dim),
-        cuda::free
-    };
-
-    cuda::check(cudaMemcpy(cnvDev.get(), cnv.data(),
+    fr = t.measure("Allocating & copying CNV to the device");
+    cuda::Buffer<real> cnvDev(nvec * dim);
+    cuda::check(cudaMemcpy(cnvDev, cnv.data(),
                            nvec * dim * sizeof(real),
                            cudaMemcpyHostToDevice));
-    t.leave();
+    fr.resolve();
 
     if (debugMode) {
-        t.enter("Similarity (Host)");
-        host::similarity(cnv.data(), simHost.get(), dim, nvec);
-        reportStats(simHost.get(), nvec);
-        t.leave();
+        fr = t.measure("Similarity (Host)");
+        host::similarity(cnv.data(), simHost, dim, nvec);
+        reportStats(simHost, nvec);
+        fr.leave();
     }
 
-    vector<int> sides = { 4, 8, 12, 16, 20, 24, 28, 32 };
-    for (int x: sides) {
-        for (int y: sides) {
+    int sides[] = { 4, 8, 12, 16, 20, 24, 28, 32 };
+    typedef void (*method_t)(real*, real*, dim3, int, int);
+
+    method_t methods[] = { &device::similarity_noshared };
+    string labels[] = { "Device / No Shared" };
+
+    size_t nsides = sizeof(sides) / sizeof(int);
+    for (int i = 0; i < nsides; ++i) {
+        int x = sides[i];
+        for (int j = 0; j < nsides; ++j) {
+            int y = sides[j];
             if (x != 4 || y != 4) {
-                stringstream ss {};
-                ss << "Similarity (Device -"
-                   << " X = " << x
-                   << "; Y = " << y
-                   << ")";
+                for (int m = 0; m < 1; ++m) {
+                    stringstream ss;
+                    ss << "Similarity (" << labels[m] << " - "
+                       << " X = " << x
+                       << "; Y = " << y
+                       << ")";
 
-                dim3 block(x, y);
+                    dim3 block(x, y);
 
-                t.enter(ss.str());
-                device::similarity(cnvDev.get(), simDev.get(), block, dim, nvec);
-                cuda::check(cudaMemcpy(simDevLocal.get(), simDev.get(),
-                                       nvec * nvec * sizeof(real),
-                                       cudaMemcpyDeviceToHost));
-                real dur = t.leave();
+                    fr = t.measure(ss.str(), false);
+                    for (size_t i = 0; i < 10; ++i) {
+                        fr.enter();
+                        methods[m](cnvDev, simDev, block, dim, nvec);
+                        cuda::check(cudaMemcpy(simDevLocal, simDev,
+                                            nvec * nvec * sizeof(real),
+                                            cudaMemcpyDeviceToHost));
+                        fr.leave();
+                    }
+                    real total, mean, std;
+                    fr.resolve(total, mean, std);
 
-                cout << "X " << x << " Y " << y
-                     << " TIME " << dur << '\n';
+                    cout << "X " << x << " Y " << y
+                        << " TIME " << mean << '\n';
 
-                if (debugMode) {
-                    reportStats(simDevLocal.get(), nvec);
-                    real corr = correlation(simDevLocal.get(), simHost.get(), nvec * nvec);
-                    cerr << "Correlation: " << corr << '\n';
+                    if (debugMode) {
+                        reportStats(simDevLocal, nvec);
+                        real corr = correlation(simDevLocal, simHost, nvec);
+                        cerr << "Correlation: " << corr << '\n';
+                    }
                 }
             }
         }
