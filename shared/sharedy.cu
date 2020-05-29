@@ -16,7 +16,8 @@ using namespace std;
 
 // Default numeric type.
 typedef float real;
-#define TILE 32
+#define WARP 32
+#define XYLIM 32
 
 bool debugMode = false;
 
@@ -208,30 +209,42 @@ namespace device {
     __global__ void scalar_conflicts(real *mat, int dim, int nvec, real *res) {
         if (blockIdx.x * blockDim.x > (blockIdx.y + 1) * blockDim.y)
             return;
-        
-        int xidx = blockIdx.x * blockDim.x + threadIdx.x;
-        real *x = xidx < nvec ? &mat[xidx * dim] : NULL;
-
-        int yidx = blockIdx.y * blockDim.y + threadIdx.y;
-        real *y = yidx < nvec ? &mat[yidx * dim] : NULL;
-        
-        __shared__ real left[TILE][TILE], right[TILE][TILE];
+           
+        __shared__ real left[XYLIM][WARP], right[XYLIM][WARP];
         real sum = 0.0f;
-        for (int i = 0; i < dim; i += blockDim.x) {
-            if (x && i + threadIdx.y < dim)
-                left[threadIdx.x][threadIdx.y] = x[i + threadIdx.y];
-            if (y && i + threadIdx.x < dim)
-                right[threadIdx.x][threadIdx.y] = y[i + threadIdx.x];
+        const int warpmax = (blockDim.x * blockDim.y) / WARP;
+        const int tidx = threadIdx.y * blockDim.x + threadIdx.x;
+        const int warpidx = tidx / WARP, localidx = tidx % WARP;
+        const int effx = min(blockDim.x * (blockIdx.x + 1), nvec) - blockDim.x * blockIdx.x;
+        const int effy = min(blockDim.y * (blockIdx.y + 1), nvec) - blockDim.y * blockIdx.y;
+        int j;
+        real *xoff = &mat[blockDim.x * blockIdx.x * dim + localidx];
+        real *yoff = &mat[blockDim.y * blockIdx.y * dim + localidx];
+
+        for (int i = 0; i < dim; i += WARP, xoff += WARP, yoff += WARP) {
+            if (warpidx < warpmax && i + localidx < dim) {
+                for (j = warpidx; j < effx; j += warpmax) {
+                    left[j][localidx] = xoff[dim * j];
+                }
+                for (j = warpidx; j < effy; j += warpmax) {
+                    right[j][localidx] = yoff[dim * j];
+                }
+            }
             __syncthreads();
-            
-            for (int j = 0; j < blockDim.x && i + j < dim; ++j) {
-                sum += left[threadIdx.x][j] * right[j][threadIdx.y];
+
+            if (threadIdx.x < effx && threadIdx.y < effy) {
+                for (j = 0; j < WARP && i + j < dim; ++j) {
+                    sum += left[threadIdx.x][j] * right[threadIdx.y][j];
+                }
             }
             __syncthreads();
         }
 
-        if (x && y)
+        if (threadIdx.x < effx && threadIdx.y < effy) {
+            const int xidx = blockDim.x * blockIdx.x + threadIdx.x;
+            const int yidx = blockDim.y * blockIdx.y + threadIdx.y;
             res[xidx * nvec + yidx] = sum;
+        }
     }
 
     void similarity_conflicts(real *cnv, real *sim, dim3 block, int dim, int nvec) {
@@ -242,30 +255,42 @@ namespace device {
     __global__ void scalar_noconflicts(real *mat, int dim, int nvec, real *res) {
         if (blockIdx.x * blockDim.x > (blockIdx.y + 1) * blockDim.y)
             return;
-        
-        int xidx = blockIdx.x * blockDim.x + threadIdx.x;
-        real *x = xidx < nvec ? &mat[xidx * dim] : NULL;
-
-        int yidx = blockIdx.y * blockDim.y + threadIdx.y;
-        real *y = yidx < nvec ? &mat[yidx * dim] : NULL;
-        
-        __shared__ real left[TILE][TILE+1], right[TILE][TILE+1];
+           
+        __shared__ real left[XYLIM][WARP + 1], right[XYLIM][WARP + 1];
         real sum = 0.0f;
-        for (int i = 0; i < dim; i += blockDim.x) {
-            if (x && i + threadIdx.y < dim)
-                left[threadIdx.x][threadIdx.y] = x[i + threadIdx.y];
-            if (y && i + threadIdx.x < dim)
-                right[threadIdx.x][threadIdx.y] = y[i + threadIdx.x];
+        const int warpmax = (blockDim.x * blockDim.y) / WARP;
+        const int tidx = threadIdx.y * blockDim.x + threadIdx.x;
+        const int warpidx = tidx / WARP, localidx = tidx % WARP;
+        const int effx = min(blockDim.x * (blockIdx.x + 1), nvec) - blockDim.x * blockIdx.x;
+        const int effy = min(blockDim.y * (blockIdx.y + 1), nvec) - blockDim.y * blockIdx.y;
+        int j;
+        real *xoff = &mat[blockDim.x * blockIdx.x * dim + localidx];
+        real *yoff = &mat[blockDim.y * blockIdx.y * dim + localidx];
+
+        for (int i = 0; i < dim; i += WARP, xoff += WARP, yoff += WARP) {
+            if (warpidx < warpmax && i + localidx < dim) {
+                for (j = warpidx; j < effx; j += warpmax) {
+                    left[j][localidx] = xoff[dim * j];
+                }
+                for (j = warpidx; j < effy; j += warpmax) {
+                    right[j][localidx] = yoff[dim * j];
+                }
+            }
             __syncthreads();
-            
-            for (int j = 0; j < blockDim.x && i + j < dim; ++j) {
-                sum += left[threadIdx.x][j] * right[j][threadIdx.y];
+
+            if (threadIdx.x < effx && threadIdx.y < effy) {
+                for (j = 0; j < WARP && i + j < dim; ++j) {
+                    sum += left[threadIdx.x][j] * right[threadIdx.y][j];
+                }
             }
             __syncthreads();
         }
 
-        if (x && y) 
+        if (threadIdx.x < effx && threadIdx.y < effy) {
+            const int xidx = blockDim.x * blockIdx.x + threadIdx.x;
+            const int yidx = blockDim.y * blockIdx.y + threadIdx.y;
             res[xidx * nvec + yidx] = sum;
+        }
     }
 
     void similarity_noconflicts(real *cnv, real *sim, dim3 block, int dim, int nvec) {
@@ -398,7 +423,7 @@ int main(int argc, char **argv) {
         fr.leave();
     }
 
-    int sides[] = { 4, 8, 12, 16, 20, 24, 28, 32 };
+    int sides[] = { 4, 8, 16, 24, 32 };
     typedef void (*method_t)(real*, real*, dim3, int, int);
 
     method_t methods[] = { &device::similarity_noshared, &device::similarity_conflicts, 
@@ -411,7 +436,7 @@ int main(int argc, char **argv) {
         int x = sides[i];
         for (int j = 0; j < nsides; ++j) {
             int y = sides[j];
-            if ((x != 4 || y != 4) && (x == y)) {
+            if (x != 4 || y != 4) {
                 for (int m = 0; m < nmethods; ++m) {
                     stringstream ss;
                     ss << "Similarity (" << labels[m] << " - "
