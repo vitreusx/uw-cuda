@@ -1,4 +1,3 @@
-#include <__clang_cuda_device_functions.h>
 #include <cstdlib>
 #include <cuda_runtime_api.h>
 #include <math.h>
@@ -28,7 +27,8 @@ void check() {
     verify(cudaGetLastError());
 }
 
-template <typename T> class DevBuffer {
+template <typename T>
+class DevBuffer {
 private:
     T *ptr;
 
@@ -41,6 +41,19 @@ public:
         verify(cudaMalloc((void **)&ptr, sizeof(T) * nelems));
     }
 
+    DevBuffer(DevBuffer const& other) = delete;
+    DevBuffer& operator=(DevBuffer const& other) = delete;
+
+    DevBuffer(DevBuffer&& other) {
+        *this = move(other);
+    }
+
+    DevBuffer& operator=(DevBuffer&& other) {
+        ptr = other.ptr;
+        other.ptr = NULL;
+        return *this;
+    }
+
     ~DevBuffer() {
         if (ptr)
             verify(cudaFree(ptr));
@@ -51,7 +64,8 @@ public:
     }
 };
 
-template <typename T> class HostBuffer {
+template <typename T>
+class HostBuffer {
 private:
     T *ptr;
 
@@ -62,6 +76,19 @@ public:
 
     HostBuffer(int nelems) {
         verify(cudaMallocHost((void **)&ptr, sizeof(T) * nelems));
+    }
+
+    HostBuffer(HostBuffer const& other) = delete;
+    HostBuffer& operator=(HostBuffer const& other) = delete;
+
+    HostBuffer(HostBuffer&& other) {
+        *this = move(other);
+    }
+
+    HostBuffer& operator=(HostBuffer&& other) {
+        ptr = other.ptr;
+        other.ptr = NULL;
+        return *this;
     }
 
     ~HostBuffer() {
@@ -160,7 +187,7 @@ public:
     inline operator cudaStream_t() {
         return stream;
     }
-}
+};
 
 namespace device {
     template<size_t Block>
@@ -185,8 +212,8 @@ namespace device {
         int tid = threadIdx.x,
             lo = (tid * dim) / blockDim.x,
             hi = ((tid + 1) * dim) / blockDim.x;
-        real total = 0;
 
+        real total = 0;
         for (int i = lo; i < hi; ++i) {
             total += vect[i] * vect[i];
         }
@@ -217,14 +244,14 @@ namespace device {
         }
         if (tid < 32) warpReduce<Block>(aux, tid);
         __syncthreads();
-
-        real norm = aux[0];
+        
+        real norm = sqrtf(aux[0]);
         for (int i = lo; i < hi; ++i) {
             vect[i] /= norm;
         }
     }
 
-    __global__ void scalar(real *mat, int dim, int nvec, real *res) {
+    __global__ void similarity(real *mat, int dim, int nvec, real *res) {
         // We skip sectors below the diagonal.
         if (blockIdx.x * blockDim.x > (blockIdx.y + 1) * blockDim.y)
             return;
@@ -250,8 +277,10 @@ namespace device {
             __syncthreads();
         }
 
-        if (x && y)
+        if (x && y) {
             res[xid * nvec + yid] = sum;
+            res[yid * nvec + xid] = sum;
+        }
     }
 }
 
@@ -260,11 +289,12 @@ private:
     string filename;
     bool debugMode;
     Timer t;
+    Timer::Frame fr;
 
     int nvec, dim;
-    HostBuffer<real> cnvHost, simHost;
-    DevBuffer<real> cnvDev, simDev;
-    
+    HostBuffer<real> cnvOnHost, simOnHost, cnvFromDev, simFromDev;
+    DevBuffer<real> cnvOnDev, simOnDev;
+
     void retrieveData() {
         ifstream file(filename.c_str());
 
@@ -281,35 +311,117 @@ private:
         
         dim = nvec = 0;
         int i = 0;
-        
-        cnvHost = HostBuffer<real>(145 * 45000);
+
+        cnvOnHost = HostBuffer<real>(145 * 45000);
+
         while (cur) {
-            if (*cur != '\"') cnvHost[i++] = atof(cur);
+            if (*cur != '\"')
+              cnvOnHost[i++] = atof(cur);
             else ++nvec;
             cur = strtok(NULL, ",\n");
         }
         dim = i / nvec;
     }
 
-    void normalize() {
+    void normalizeDev() {
         int chunk = 8;
-        int nbytes = chunk * dim * sizeof(real);
         vector<Stream> streams(nvec / chunk + 1);
 
+        cnvOnDev = DevBuffer<real>(nvec * dim);
         for (int i = 0, off = 0; off < nvec; ++i, off += chunk) {
-            cudaMemcpyAsync(&cnvDev[off * dim], &cnvHost[off + dim], nbytes, cudaMemcpyHostToDevice, streams[i]);
-            device::normalize<256><<<chunk, 256, 0, streams[i]>>>(cnvDev, off, nvec, dim);
+            int nbytes = min(nvec - off, chunk) * dim * sizeof(real);
+            cudaMemcpyAsync(&cnvOnDev[off * dim], &cnvOnHost[off * dim], nbytes,
+                          cudaMemcpyHostToDevice, streams[i]);
+            
+            device::normalize<256>
+                <<<chunk, 256, 0, streams[i]>>>
+                (cnvOnDev, off, nvec, dim);
+        }
+        cudaDeviceSynchronize();
+    }
+
+    void normalizeHost() {
+        for (int i = 0; i < nvec; ++i) {
+            real norm = 0;
+            for (int j = 0; j < dim; ++j) {
+                auto r = cnvOnHost[dim * i + j];
+                norm += r * r;
+            }
+            norm = sqrt(norm);
+
+            for (int j = 0; j < dim; ++j) {
+                cnvOnHost[dim * i + j] /= norm;
+            }
         }
     }
 
-    void similarity() {
-        simDev = DevBuffer<real>(nvec * nvec);
+    void similarityDev() {
         dim3 block(8, 8);
         dim3 grid(nvec / block.x + 1, nvec / block.y + 1);
-        device::scalar<<<grid, block>>>(cnvDev, dim, nvec, simDev);
+        simOnDev = DevBuffer<real>(nvec * nvec);
+        device::similarity<<<grid, block>>>(cnvOnDev, dim, nvec, simOnDev);
 
         int nbytes = nvec * nvec * sizeof(real);
-        verify(cudaMemcpy(simHost, simDev, nbytes, cudaMemcpyDeviceToHost));
+        simFromDev = HostBuffer<real>(nvec * nvec);
+        verify(cudaMemcpy(simFromDev, simOnDev, nbytes, cudaMemcpyDeviceToHost));
+    }
+
+    static real scalarHost(real *x, real *y, int dim) {
+        real total = 0;
+        for (int i = 0; i < dim; ++i) {
+            total += x[i] * y[i];
+        }
+        return total;
+    }
+
+    void similarityHost() {
+        simOnHost = HostBuffer<real>(nvec * nvec);
+
+        for (int i = 0; i < nvec; ++i) {
+            real *x = cnvOnHost + dim * i;
+            for (int j = i; j < nvec; ++j) {
+                real *y = cnvOnHost + dim * j;
+                simOnHost[i*nvec+j] = simOnHost[j*nvec+i] = scalarHost(x, y, dim);
+            }
+        }
+    }
+
+    static void statsHost(real *sim, int nvec) {
+        real total = 0, max = 0, min = 1;
+
+        for (int i = 0; i < nvec; ++i) {
+            for (int j = i + 1; j < nvec; ++j) {
+                real cur = sim[i*nvec+j] * sim[i*nvec+j];
+                if (cur < min) min = cur;
+                if (cur > max) max = cur;
+                total += cur;
+            }
+        }
+
+        total /= (nvec * (nvec - 1)) / 2;
+        cerr << "Avg similarity: " << 100 * total << "%\n";
+        cerr << "Min similarity: " << 100 * min << "%\n";
+        cerr << "Max similarity: " << 100 * max << "%\n";
+    }
+
+    static real correlationHost(real *x, real *y, int dim) {
+        real xsum, ysum, xysum, xxsum, yysum;
+        xsum = ysum = xysum = xxsum = yysum = 0;
+
+        for (int id = 0; id < dim; ++id) {
+            real xi = x[id], yi = y[id];
+            xsum += xi;
+            ysum += yi;
+            xysum += xi * yi;
+            xxsum += xi * xi;
+            yysum += yi * yi;
+        }
+
+        real xmean = xsum / dim, ymean = ysum / dim;
+        real covxy = xysum - dim * xmean * ymean;
+        real varx = xxsum - dim * xmean * xmean;
+        real vary = yysum - dim * ymean * ymean;
+        return covxy / sqrt(varx * vary);
     }
 
 public:
@@ -332,7 +444,41 @@ public:
     }
 
     int run() {
+        fr = t.measure("Data");
         retrieveData();
+        fr.resolve();
+
+        fr = t.measure("Norm");
+        normalizeDev();        
+        fr.resolve();
+
+        if (debugMode) {
+            normalizeHost();
+
+            cnvFromDev = HostBuffer<real>(nvec * dim);
+            int nbytes = nvec * dim * sizeof(real);
+            verify(cudaMemcpy(cnvFromDev, cnvOnDev, nbytes, cudaMemcpyDeviceToHost));
+
+            auto corr = correlationHost(cnvFromDev, cnvOnHost, nvec * dim);
+            cerr << "Correlation [CNVs]: " << corr << '\n';
+        }
+
+        fr = t.measure("Sim");
+        similarityDev();
+        fr.resolve();
+
+        cerr << "Stats (simFromDev):\n"; 
+        statsHost(simFromDev, nvec);
+
+        if (debugMode) {
+            similarityHost();
+            cerr << "Stats (simOnHost):\n"; 
+            statsHost(simOnHost, nvec);
+
+            auto corr = correlationHost(simFromDev, simOnHost, nvec * nvec);
+            cerr << "Correlation [Sims]: " << corr << '\n';
+        }
+
         return EXIT_SUCCESS;
     }
 };
@@ -350,6 +496,7 @@ int main(int argc, char **argv) {
     catch (exception &e) {
         cerr.clear();
         cerr << "[ERROR] Message: " << e.what() << endl;
+        cout << "Exiting\n";
         return EXIT_FAILURE;
     }
 }
