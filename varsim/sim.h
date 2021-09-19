@@ -47,44 +47,4 @@ namespace dev {
             sim[xidx * nvec + yidx] = sim[yidx * nvec + xidx] = sum;
         }
     }
-
-    template<int Y>
-    __global__ void sim_ker1(real *mat, int nvec, int dim, real *sim) {
-        if (blockIdx.x * blockDim.x > (blockIdx.y + 1) * blockDim.y)
-            return;
-
-        __shared__ real left[WARP][WARP + 1], right[Y][WARP + 1];
-        real sum = 0;
-        int j;
-
-        int effx = min(blockDim.x, nvec - blockDim.x * blockIdx.x);
-        int effy = min(blockDim.y, nvec - blockDim.y * blockIdx.y);
-
-        real *xvec = &mat[WARP * blockIdx.x * dim + threadIdx.x];
-        real *yvec = &mat[Y * blockIdx.y * dim + threadIdx.x];
-        for (int i = 0; i < dim; i += WARP, xvec += WARP, yvec += WARP) {
-            if (i + threadIdx.x < dim) {
-                for (j = threadIdx.y; j < effx; j += Y) {
-                    left[j][threadIdx.x] = xvec[dim * j];
-                }
-                for (j = threadIdx.y; j < effy; j += Y) {
-                    right[j][threadIdx.x] = yvec[dim * j];
-                }
-            }
-            __syncthreads();
-
-            if (threadIdx.x < effx && threadIdx.y < effy) {
-                for (j = 0; j < WARP && i + j < dim; ++j) {
-                    sum += left[threadIdx.x][j] * right[threadIdx.y][j];
-                }
-            }
-            __syncthreads();
-        }
-
-        if (threadIdx.x < effx && threadIdx.y < effy) {
-            int xidx = blockDim.x * blockIdx.x + threadIdx.x;
-            int yidx = blockDim.y * blockIdx.y + threadIdx.y;
-            sim[xidx * nvec + yidx] = sim[yidx * nvec + xidx] = sum;
-        }
-    }
 }

@@ -1,5 +1,6 @@
 SOURCES = utils cnv metrics norm \
-          sim stream timer main
+          sim stream timer main \
+		  transpose
 
 %.o: %.cu
 	nvcc -O2 -std=c++11 -c -o $@ $^
@@ -7,7 +8,7 @@ SOURCES = utils cnv metrics norm \
 %.o: %.cpp
 	nvcc -O2 -std=c++11 -c -o $@ $^
 
-refact: $(patsubst %,%.o,$(SOURCES))
+simvar: $(patsubst %,%.o,$(SOURCES))
 	nvcc -O2 -std=c++11 $^ -o $@
 
 .PHONY: clean
@@ -16,4 +17,4 @@ clean:
 
 .PHONY: deliver
 deliver:
-	rsync -r . j.bednarz@cuda:~/refact
+	rsync -r . j.bednarz@cuda:~/varsim

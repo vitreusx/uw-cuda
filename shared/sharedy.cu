@@ -455,6 +455,7 @@ int main(int argc, char **argv) {
                         cuda::check(cudaMemcpy(simDevLocal, simDev,
                                             nvec * nvec * sizeof(real),
                                             cudaMemcpyDeviceToHost));
+                        cudaDeviceSynchronize();
                         fr.leave();
                     }
                     real total, mean, std;

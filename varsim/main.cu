@@ -50,13 +50,6 @@ private:
         check();
     }
 
-    void simv2() {
-        dim3 block(32, 6);
-        dim3 grid(cnv.nvec / block.x + 1, cnv.nvec / block.y + 1);
-        dev::sim_ker1<6><<<grid, block>>>(cnvOnDev, cnv.nvec, cnv.dim, simOnDev);
-        check();
-    }
-
     void copySim() {
         int nbytes = sizeof(real) * cnv.nvec * cnv.nvec;
         check(cudaMemcpy(simFromDev, simOnDev, nbytes, cudaMemcpyDeviceToHost));
@@ -106,26 +99,6 @@ private:
         copySim();
     }
 
-    void nonOverlappedV2() {
-        int chunk = 16;
-        vector<Stream> streams(cnv.nvec / chunk + 1);
-
-        cnvOnDev = DevBuffer<real>(cnv.dim * cnv.nvec);
-        simOnDev = DevBuffer<real>(cnv.nvec * cnv.nvec);
-
-        for (int off = 0, ns = 0; off < cnv.nvec; off += chunk, ++ns) {
-            int span = min(chunk, cnv.nvec - off);
-            copyToDev(span, off, streams[ns]);
-            norm(span, off, streams[ns]);
-        }
-        cudaDeviceSynchronize();
-
-        simv2();
-
-        simFromDev = HostBuffer<real>(cnv.nvec * cnv.nvec);
-        copySim();
-    }
-
 public:
     Main(int argc, char **argv) {
         char *filenamePtr = NULL;
@@ -162,14 +135,6 @@ public:
         for (int i = 0; i < 50; ++i) {
             fr.enter();
             nonOverlapped();
-            fr.leave();
-        }
-        fr.resolve();
-
-        fr = t.measure("Non-Over V2", false);
-        for (int i = 0; i < 50; ++i) {
-            fr.enter();
-            nonOverlappedV2();
             fr.leave();
         }
         fr.resolve();

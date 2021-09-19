@@ -1,5 +1,5 @@
-#include "stream.h"
-#include "utils.h"
+#include "stream.cuh"
+#include "utils.cuh"
 
 Stream::Stream() {
     check(cudaStreamCreate(&stream));

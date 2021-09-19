@@ -1,0 +1,59 @@
+- W każdym folderze jest Makefile; można wpisać `make` lub `make clean`.
+
+Zadanie 1:
+~j.bednarz/shared/
+
+Co do porównania wyników, przygotowałem poniższą tabelkę:
+
+*       4      8     16     24     32
+4  N/A    0.046  0.0468 0.0492 0.0508
+-  N/A    0.0248 0.0206 0.0164 0.0154
+-  N/A    0.0228 0.0136 0.0094 0.0088
+8  0.0452 0.0452 0.0462 0.046  0.0492
+-  0.0282 0.0202 0.0132 0.0146 0.015
+-  0.0238 0.0126 0.007  0.0076 0.0074
+16 0.0654 0.0654 0.0694 0.0674 0.0842
+-  0.0278 0.0182 0.0192 0.0194 0.0232
+-  0.0148 0.007  0.007  0.0074 0.0082
+24 0.112  0.1038 0.0974 0.1362 0.1172
+-  0.0306 0.0272 0.0268 0.036  0.0312
+-  0.0092 0.0074 0.0072 0.008  0.0072
+32 0.1334 0.1522 0.1494 0.1494 0.1986
+-  0.0322 0.0372 0.039  0.0396 0.0522
+-  0.0086 0.0076 0.0072 0.0072 0.0088
+
+Kolumny/Wiersze: geometria bloku
+Dla każdej konfiguracji są 3 wartości (bez zmian, z konfliktami, bez konfliktów).
+
+Komentarz:
+- wyniki podążają standardowy trend (i.e. koło liczby wątków 256 jest wystarczające occupancy);
+- w wersji z konfliktami dodawanie wątków pogorsza efektywność w stopniu większym niż w wersji bez większej ilości wątków - zapewne większa ilość wątków powoduje więcej konflików w tej wersji.
+
+Sprawdziłem także czy czytanie pamięci za pomocą 1 warpa czy wszystkich warpów jest lepsze, i to drugie wyszło odrobinę szybsze, więc to stosuję.
+
+Zadanie 2:
+~j.bednarz/refact
+
+Wedle sugestii Pana profesora chciałem w jakimś stopniu nałożyć obliczenia - problem jest taki, że trudno to zrobić. Żeby obliczyć macierz podobieństwa dla lewej górnej części (która reprezentuje 1/4 wszystkich obliczeń), trzeba przetransportować 1/2 macierzy CNV etc. W każdym razie, zpreprarowałem obie wersje (Over, Non-Over), które można sprawdzić (wychodzi mi 0.0186s vs 0.0116s respectively). Co do "refaktoryzacji", podzieliłem rozwiązanie na pliki .cu, .cpp i .h.
+
+Zadanie 3:
+~j.bednarz/exp
+./third ../neuro/neuroblastoma_CNV.csv
+
+W folderze utils/ są moduły (timer, funkcje od normalizacji etc.); w samym folderze jest third.cu (i tam jest rozwiązanie proper), i także inne pliki, gdzie eksperymentowałem.
+
+Co do transpozycji, finalnie uznałem, iż performance gain z użycia rejestrów jest zbyt mały, żeby wymyślać jak tutaj to zaimplementować (a więc implementacja jest z użyciem shared memory.) Jest ona jednak zbyt szybka, żebym mógł ją tu mierzyć, więc czasy nie zawierają tego czasu - do bardziej ogólnej analizy, w trans.cu jest transpozycja tablicy 20k x 20k (która zresztą też jest bardzo szybka).
+
+W związku z konstrukcją algorytmu (bloki WARP x n, żeby móc używać threadIdx.x i threadIdx.y do indeksacji warpów), testuję tylko takie bloki (dla n = 8... 32). Uznałem, że będę mierzył tylko samo obliczenie macierzy podobieństwa. W rozwiązaniu z transpozycją i poprzednim kernelem, używam bloków n x n.
+
+B     8 x 8   12 x 12 16 x 16 20 x 20 24 x 24  28 x 28 32 x 32
+Prior 1.53917 1.26776 1.14438 1.24378 1.1901   1.29242 1.06377
+
+B     32 x 8  32 x 12 32 x 16 32 x 20 32 x 24  32 x 28 32 x 32
+New   1.2765  1.12738 1.06885 1.04264 0.997764 1.01227 0.995032
+
+Tak więc nowy algorytm jest trochę szybszy niż poprzedni (ale tylko trochę), i stabilizuje się koło 512 wątków (co, szczerze mówiąc, trudno mi prosto wyjaśnić, zważywszy na fakt, iż SM ma 192 SPs -- podejrzewałbym dostęp do pamięci współdzielonej, ale nie mogę tego zweryfikować.)
+
+
+Pozdrawiam,
+Jakub Bednarz.
